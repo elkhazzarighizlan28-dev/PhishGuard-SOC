@@ -1,0 +1,15 @@
+From: support@paypa1.example
+Reply-To: attacker@evil.example
+Subject: Urgent! Your account is locked
+Date: Fri, 7 Nov 2026 09:00:00 +0000
+Message-ID: <test001@example>
+
+Dear user,
+
+Your account has been locked.
+Verify your account within 24 hours:
+
+http://login-paypa1.example/verify
+
+Regards,
+Security Team
