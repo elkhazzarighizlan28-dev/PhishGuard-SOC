@@ -198,5 +198,40 @@ def analyze_email(email):
         "authentication": authentication,
     }
 
+def test_spf_failure_creates_finding():
+    email = {
+        "from": "attacker@example.com",
+        "reply_to": "",
+        "subject": "Hello",
+        "body": "Normal message",
+        "authentication_results": [
+            "mx.example.com; spf=fail"
+        ],
+    }
+
+    result = analyze_email(email)
+
+    assert any(
+        finding["type"] == "SPF_FAIL"
+        for finding in result["findings"]
+    )
+
+
+def test_dmarc_failure_increases_risk_score():
+    email = {
+        "from": "attacker@example.com",
+        "reply_to": "",
+        "subject": "Hello",
+        "body": "Normal message",
+        "authentication_results": [
+            "mx.example.com; dmarc=fail"
+        ],
+    }
+
+    result = analyze_email(email)
+
+    assert result["risk_score"] == 30
+    assert result["risk_level"] == "MEDIUM"
+
 
 

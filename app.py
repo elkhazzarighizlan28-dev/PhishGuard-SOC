@@ -98,9 +98,10 @@ AUTH_BAD = {"fail", "softfail", "permerror", "temperror"}
 
 MAX_AUTH_HEADERS = 20
 TRUSTED_AUTHSERV_ENV = "PHISHGUARD_TRUSTED_AUTHSERV_IDS"
-AUTHSERV_RE = re.compile(r"^[a-z0-9]([a-z0-9._-]{0,251}[a-z0-9])?$")
+AUTHSERV_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,251}[a-z0-9])?$")
 AUTH_RESULT_RE = re.compile(r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)", re.IGNORECASE)
 HEADER_FROM_RE = re.compile(r"\bheader\.from\s*=\s*([^\s;]+)", re.IGNORECASE)
+
 STRUCT_HEADERS = ("from", "to", "subject", "date", "message-id", "received", "return-path")
 
 # Utilisés uniquement si le moteur n'expose pas RISK_THRESHOLDS :
@@ -286,6 +287,16 @@ def derive_level(score: int) -> str:
         if score >= minimum:
             return level
     return "LOW"
+def risk_card(score: int, level: str) -> None:
+    notes = {
+        "CRITICAL": "Plusieurs indicateurs forts. Ne pas interagir avec ce message et l'escalader immédiatement.",
+        "HIGH": "Message très probablement malveillant. Isoler et enquêter avant toute action.",
+        "MEDIUM": "Indicateurs suspects. Une vérification manuelle est nécessaire.",
+        "LOW": "Aucun indicateur fort. Cela ne garantit pas que le message soit légitime.",
+    }
+
+    score = clamp(to_int(score))
+    level = derive_level(score)
 
 
 def normalize_result(raw: Mapping[str, Any], auth: dict[str, str]) -> dict[str, Any]:
@@ -588,6 +599,7 @@ def load_source(source: str, uploaded) -> tuple[bytes | None, str]:
 # COMPOSANTS D'INTERFACE
 # ============================================================
 
+
 def risk_card(score: int, level: str) -> None:
     notes = {
         "CRITICAL": "Plusieurs indicateurs forts. Ne pas interagir avec ce message et l'escalader immédiatement.",
@@ -595,16 +607,36 @@ def risk_card(score: int, level: str) -> None:
         "MEDIUM": "Indicateurs suspects. Une vérification manuelle est nécessaire.",
         "LOW": "Aucun indicateur fort. Cela ne garantit pas que le message soit légitime.",
     }
-    # Seules des valeurs issues de listes blanches ou d'entiers bornés sont injectées.
-    score = clamp(to_int(raw.get("risk_score")))
+
+    # Normalisation du score et du niveau de risque
+    score = clamp(to_int(score))
     level = derive_level(score)
+
+    # Couleur selon le niveau de risque
+    colors = {
+        "CRITICAL": "#7f1d1d",
+        "HIGH": "#dc2626",
+        "MEDIUM": "#d97706",
+        "LOW": "#16a34a",
+    }
+    color = colors.get(level, "#64748b")
+
     st.markdown(
         f"""
         <div class="risk-card" style="--accent:{color}; --pct:{int(score)};">
-            <div class="gauge"><div><span>{int(score)}</span><small>sur 100</small></div></div>
+            <div class="gauge">
+                <div>
+                    <span>{int(score)}</span>
+                    <small>sur 100</small>
+                </div>
+            </div>
             <div>
-                <div class="risk-level">Niveau {html.escape(level.lower())}</div>
-                <div class="risk-note">{html.escape(notes[level])}</div>
+                <div class="risk-level">
+                    Niveau {html.escape(level.lower())}
+                </div>
+                <div class="risk-note">
+                    {html.escape(notes[level])}
+                </div>
             </div>
         </div>
         """,
@@ -612,41 +644,65 @@ def risk_card(score: int, level: str) -> None:
     )
 
 
+
 def render_overview(data: dict[str, Any], show: Callable[[str], str]) -> None:
-    email, result = data["email"], data["result"]
+    email = data["email"]
+    result = data["result"]
+
+    # Affichage de la carte du risque
     risk_card(result["risk_score"], result["risk_level"])
     st.write("")
 
+    # Indicateurs principaux
     c1, c2, c3 = st.columns(3)
+
     c1.metric("Score de risque", f'{result["risk_score"]}/100')
     c2.metric("Constats", result["total_findings"])
     c3.metric("Indicateurs extraits", len(data["iocs"]))
 
     st.write("")
+
     left, right = st.columns([3, 2], gap="large")
 
+    # Informations sur l'e-mail
     with left:
         st.subheader("Message")
+
         st.caption("Expéditeur")
         st.code(show(email["from"]) or "Inconnu", language=None)
+
         st.caption("Adresse de réponse")
         st.code(show(email["reply_to"]) or "Non renseignée", language=None)
+
         st.caption("Objet")
         st.code(show(email["subject"]) or "Sans objet", language=None)
+
         st.caption("Date")
         st.text(email["date"] or "Inconnue")
 
+    # Répartition des constats
     with right:
         st.subheader("Répartition")
-        counts = Counter(f["severity"] for f in result["findings"])
+
+        counts = Counter(
+            finding["severity"]
+            for finding in result["findings"]
+        )
+
         if counts:
-            chart = {s: counts[s] for s in SEVERITY_ORDER if counts[s]}
+            chart = {
+                severity: counts[severity]
+                for severity in SEVERITY_ORDER
+                if counts[severity] > 0
+            }
             st.bar_chart(chart, horizontal=True)
         else:
             st.success("Aucun constat à répartir.")
 
+        # Vérification des en-têtes
         if data["header_notes"]:
             st.subheader("Contrôles d'en-têtes")
+
             for note in data["header_notes"]:
                 st.warning(note)
 
