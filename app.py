@@ -107,7 +107,7 @@ STRUCT_HEADERS = ("from", "to", "subject", "date", "message-id", "received", "re
 
 # Utilisés uniquement si le moteur n'expose pas RISK_THRESHOLDS :
 # à aligner sur detection_engine.py.
-FALLBACK_RISK_THRESHOLDS = (("CRITICAL", 80), ("HIGH", 60), ("MEDIUM", 30))
+FALLBACK_RISK_THRESHOLDS = (("CRITICAL", 70), ("HIGH", 40), ("MEDIUM", 20))
 
 # Regex volontairement simples et bornées (pas de backtracking catastrophique).
 URL_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}]{1,2048}", re.IGNORECASE)
@@ -294,18 +294,6 @@ def derive_level(score: int) -> str:
         if score >= minimum:
             return level
     return "LOW"
-def risk_card(score: int, level: str) -> None:
-    notes = {
-        "CRITICAL": "Plusieurs indicateurs forts. Ne pas interagir avec ce message et l'escalader immédiatement.",
-        "HIGH": "Message très probablement malveillant. Isoler et enquêter avant toute action.",
-        "MEDIUM": "Indicateurs suspects. Une vérification manuelle est nécessaire.",
-        "LOW": "Aucun indicateur fort. Cela ne garantit pas que le message soit légitime.",
-    }
-
-    score = clamp(to_int(score))
-    level = derive_level(score)
-
-
 def normalize_result(raw: Mapping[str, Any], auth: dict[str, str]) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     for item in list(raw.get("findings") or [])[:MAX_FINDINGS]:
@@ -398,6 +386,12 @@ def extract_iocs(body: str) -> list[dict[str, str]]:
         })
 
     # 2. Extraction des adresses IPv4
+    private_networks = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    )
+
     for match in IPV4_RE.finditer(text):
         if len(rows) >= MAX_IOCS:
             return rows
@@ -414,13 +408,20 @@ def extract_iocs(body: str) -> list[dict[str, str]]:
             continue
 
         seen.add(key)
-        scope = "privée" if addr.is_private else "publique"
+
+        if any(addr in network for network in private_networks):
+            scope = "privée"
+        elif addr.is_global:
+            scope = "publique"
+        else:
+            scope = "réservée / non publique"
 
         rows.append({
             "Type": "IP",
             "Valeur": ip,
             "Alertes": f"adresse {scope}",
         })
+
 
     # 3. Extraction des domaines
     for match in DOMAIN_RE.finditer(text):
@@ -453,10 +454,6 @@ def extract_iocs(body: str) -> list[dict[str, str]]:
         })
 
     return rows
-
-
-
-
 
 def domain_of(address: str) -> str:
     _, addr = parseaddr(address)
@@ -626,7 +623,6 @@ def evaluate_auth_trust(
     }
 
 
-@st.cache_data(show_spinner=False, max_entries=16, ttl=3600)
 def run_analysis(data: bytes, trusted_ids: tuple[str, ...]) -> dict[str, Any]:
     validate_structure(data)
     raw = parse_email_bytes(data)

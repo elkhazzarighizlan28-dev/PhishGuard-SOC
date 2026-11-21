@@ -106,3 +106,37 @@ def test_dmarc_failure_increases_risk_score():
 
     assert result["risk_score"] == 30
     assert result["risk_level"] == "MEDIUM"
+
+
+def test_reply_to_same_address_with_display_names_is_not_mismatch():
+    email = {
+        "from": "Support Team <support@example.com>",
+        "reply_to": "Support <support@example.com>",
+        "subject": "Hello",
+        "body": "Normal message",
+        "authentication_results": [],
+    }
+
+    result = analyze_email(email)
+
+    assert not any(
+        finding["type"] == "REPLY_TO_MISMATCH"
+        for finding in result["findings"]
+    )
+
+
+def test_reply_to_different_addresses_is_mismatch():
+    email = {
+        "from": "Support <support@example.com>",
+        "reply_to": "Attacker <attacker@evil.com>",
+        "subject": "Hello",
+        "body": "Normal message",
+        "authentication_results": [],
+    }
+
+    result = analyze_email(email)
+
+    assert any(
+        finding["type"] == "REPLY_TO_MISMATCH"
+        for finding in result["findings"]
+    )

@@ -8,6 +8,15 @@ def main():
         "samples/suspicious_email.eml"
     )
 
+    # CLI mode does not verify the origin of Authentication-Results.
+    # Ignore them to avoid trusting potentially forged email headers.
+    email["authentication_results"] = []
+
+    print(
+        "[INFO] CLI mode: Authentication-Results ignored "
+        "(source not verified)."
+    )
+
     result = analyze_email(email)
 
     print("\n========== PHISHGUARD SOC ==========")

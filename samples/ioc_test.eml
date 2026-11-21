@@ -1,0 +1,12 @@
+From: security@example.org
+To: analyst@example.com
+Subject: IOC extraction test
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+
+Please investigate these indicators:
+
+URL: http://suspicious-example.com/login
+Public IP: 198.51.100.23
+Private IP: 192.168.1.10
+Domain: secure-account.click

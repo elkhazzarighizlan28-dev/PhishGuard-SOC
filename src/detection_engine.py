@@ -1,9 +1,17 @@
+from email.utils import parseaddr
 from src.auth_analyzer import (
     analyze_authentication,
     build_auth_findings,
 )
 import re
 from urllib.parse import urlparse
+
+
+RISK_THRESHOLDS = (
+    ("CRITICAL", 70),
+    ("HIGH", 40),
+    ("MEDIUM", 20),
+)
 
 
 URGENCY_KEYWORDS = [
@@ -41,9 +49,12 @@ def extract_urls(text):
 
 
 def analyze_reply_to(email):
-    """Check whether Reply-To differs from sender."""
-    sender = email.get("from", "").lower().strip()
-    reply_to = email.get("reply_to", "").lower().strip()
+    """Compare normalized sender and Reply-To email addresses."""
+    sender_raw = str(email.get("from") or "").strip()
+    reply_raw = str(email.get("reply_to") or "").strip()
+
+    sender = parseaddr(sender_raw)[1].casefold()
+    reply_to = parseaddr(reply_raw)[1].casefold()
 
     if not sender or not reply_to:
         return None
@@ -181,14 +192,11 @@ def analyze_email(email):
     )
 
     # 6. Determine risk level
-    if score >= 70:
-        risk_level = "CRITICAL"
-    elif score >= 40:
-        risk_level = "HIGH"
-    elif score >= 20:
-        risk_level = "MEDIUM"
-    else:
-        risk_level = "LOW"
+    risk_level = "LOW"
+    for level, minimum in RISK_THRESHOLDS:
+        if score >= minimum:
+            risk_level = level
+            break
 
     return {
         "risk_score": score,
@@ -197,41 +205,3 @@ def analyze_email(email):
         "total_findings": len(findings),
         "authentication": authentication,
     }
-
-def test_spf_failure_creates_finding():
-    email = {
-        "from": "attacker@example.com",
-        "reply_to": "",
-        "subject": "Hello",
-        "body": "Normal message",
-        "authentication_results": [
-            "mx.example.com; spf=fail"
-        ],
-    }
-
-    result = analyze_email(email)
-
-    assert any(
-        finding["type"] == "SPF_FAIL"
-        for finding in result["findings"]
-    )
-
-
-def test_dmarc_failure_increases_risk_score():
-    email = {
-        "from": "attacker@example.com",
-        "reply_to": "",
-        "subject": "Hello",
-        "body": "Normal message",
-        "authentication_results": [
-            "mx.example.com; dmarc=fail"
-        ],
-    }
-
-    result = analyze_email(email)
-
-    assert result["risk_score"] == 30
-    assert result["risk_level"] == "MEDIUM"
-
-
-
