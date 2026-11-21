@@ -28,6 +28,7 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
 from pathlib import Path
+from sys import flags
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -111,6 +112,12 @@ FALLBACK_RISK_THRESHOLDS = (("CRITICAL", 80), ("HIGH", 60), ("MEDIUM", 30))
 # Regex volontairement simples et bornées (pas de backtracking catastrophique).
 URL_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}]{1,2048}", re.IGNORECASE)
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+DOMAIN_RE = re.compile(
+    r"(?i)(?<![a-z0-9_-])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?![a-z0-9_-])"
+)
 EML_HEADER_RE = re.compile(
     r"^(from|to|subject|date|received|message-id|mime-version|return-path):",
     re.IGNORECASE | re.MULTILINE,
@@ -333,57 +340,122 @@ def extract_iocs(body: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
 
-    for match in URL_RE.finditer(body):
+    # Limiter la taille du contenu analysé
+    text = body[:MAX_BODY_ANALYSIS]
+
+    # 1. Extraction des URLs
+    for match in URL_RE.finditer(text):
+        if len(rows) >= MAX_IOCS:
+            return rows
+
         url = match.group(0).rstrip(".,;:!?")
         key = ("URL", url)
+
         if key in seen:
             continue
-        seen.add(key)
 
+        seen.add(key)
         flags: list[str] = []
+
         try:
             parsed = urlparse(url)
             host = (parsed.hostname or "").lower()
         except ValueError:
-            host, parsed = "", None
+            parsed = None
+            host = ""
             flags.append("URL malformée")
 
         if parsed is not None:
             if parsed.scheme == "http":
                 flags.append("HTTP non chiffré")
+
             if parsed.username or "@" in parsed.netloc:
                 flags.append("identifiants dans l'URL")
+
             if host.startswith("xn--") or ".xn--" in host:
                 flags.append("domaine punycode")
+
             if host in URL_SHORTENERS:
                 flags.append("raccourcisseur")
+
             try:
                 ipaddress.ip_address(host)
                 flags.append("hôte = adresse IP")
             except ValueError:
                 pass
-            if parsed.port and parsed.port not in (80, 443):
-                flags.append(f"port atypique {parsed.port}")
 
-        rows.append({"Type": "URL", "Valeur": url, "Alertes": ", ".join(flags) or "—"})
+            try:
+                port = parsed.port
+                if port is not None and port not in (80, 443):
+                    flags.append(f"port atypique {port}")
+            except ValueError:
+                flags.append("port invalide")
+
+        rows.append({
+            "Type": "URL",
+            "Valeur": url,
+            "Alertes": ", ".join(flags) or "—",
+        })
+
+    # 2. Extraction des adresses IPv4
+    for match in IPV4_RE.finditer(text):
         if len(rows) >= MAX_IOCS:
             return rows
 
-    for match in IPV4_RE.finditer(body):
         ip = match.group(0)
         key = ("IP", ip)
+
         if key in seen:
             continue
+
         try:
             addr = ipaddress.ip_address(ip)
         except ValueError:
             continue
+
         seen.add(key)
         scope = "privée" if addr.is_private else "publique"
-        rows.append({"Type": "IP", "Valeur": ip, "Alertes": f"adresse {scope}"})
+
+        rows.append({
+            "Type": "IP",
+            "Valeur": ip,
+            "Alertes": f"adresse {scope}",
+        })
+
+    # 3. Extraction des domaines
+    for match in DOMAIN_RE.finditer(text):
         if len(rows) >= MAX_IOCS:
-            break
+            return rows
+
+        domain = match.group(0).lower().rstrip(".")
+        key = ("DOMAIN", domain)
+
+        if key in seen:
+            continue
+
+        # Exclure les adresses IP
+        try:
+            ipaddress.ip_address(domain)
+            continue
+        except ValueError:
+            pass
+
+        seen.add(key)
+        flags: list[str] = []
+
+        if domain.startswith("xn--") or ".xn--" in domain:
+            flags.append("domaine punycode")
+
+        rows.append({
+            "Type": "DOMAIN",
+            "Valeur": domain,
+            "Alertes": ", ".join(flags) or "—",
+        })
+
     return rows
+
+
+
 
 
 def domain_of(address: str) -> str:
