@@ -1,3 +1,5 @@
+from src.sender_analyzer import analyze_sender_identity
+from src.sender_analyzer import analyze_sender_identity
 import re
 from email.utils import parseaddr
 from typing import Any
@@ -197,12 +199,19 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
     if reply_finding is not None:
         findings.append(reply_finding)
 
-    # 3. Analyse URLs.
+        # 3. Analyse URLs.
     findings.extend(
         analyze_urls(email.get("body", ""))
     )
 
-    # 4. Detect urgency language.
+    # 4. Analyse sender display-name impersonation.
+    sender_finding = analyze_sender_identity(email)
+
+    if sender_finding is not None:
+        findings.append(sender_finding)
+    
+
+    # 5. Detect urgency language.
     urgency_finding = analyze_urgency(
         email.get("subject", "") + " " + email.get("body", "")
     )
@@ -210,13 +219,13 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
     if urgency_finding is not None:
         findings.append(urgency_finding)
 
-    # 5. Calculate final risk score once.
+    # 6. Calculate final risk score once.
     score = min(
         100,
         sum(finding.score for finding in findings)
     )
 
-    # 6. Determine risk level.
+    # 7. Determine risk level.
     risk_level = "LOW"
 
     for level, minimum in RISK_THRESHOLDS:
