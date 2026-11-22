@@ -1,3 +1,4 @@
+from src.schemas import Finding
 
 import re
 from collections.abc import Sequence
@@ -68,10 +69,11 @@ def analyze_authentication(
             summary[method] = results[0]
 
     return summary
-def build_auth_findings(authentication: dict[str, str]) -> list[dict[str, Any]]:
-    """Convert authentication results into security findings."""
 
-    findings = []
+def build_auth_findings(authentication: dict[str, str]) -> list[dict[str, Any]]:
+    """Build validated authentication findings in legacy dictionary format."""
+
+    findings: list[dict[str, Any]] = []
 
     rules = {
         "spf": {
@@ -99,14 +101,16 @@ def build_auth_findings(authentication: dict[str, str]) -> list[dict[str, Any]]:
 
         severity, score = statuses[status]
 
-        findings.append({
-            "type": f"{method.upper()}_{status.upper()}",
-            "severity": severity,
-            "description": (
+        finding = Finding(
+            type=f"{method.upper()}_{status.upper()}",
+            severity=severity,
+            description=(
                 f"{method.upper()} authentication returned {status}."
             ),
-            "evidence": f"{method}={status}",
-            "score": score,
-        })
+            evidence=f"{method}={status}",
+            score=score,
+        )
+
+        findings.append(finding.to_dict())
 
     return findings
