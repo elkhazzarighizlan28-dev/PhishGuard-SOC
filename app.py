@@ -14,6 +14,7 @@ Principes de sécurité appliqués dans ce fichier :
 """
 
 from __future__ import annotations
+from src.incident_manager import create_incident
 
 import hashlib
 import html
