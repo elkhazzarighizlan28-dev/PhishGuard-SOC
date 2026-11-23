@@ -1,5 +1,6 @@
-from src.sender_analyzer import analyze_sender_identity
-from src.sender_analyzer import analyze_sender_identity
+from src.attachment_analyzer import analyze_attachments
+
+from src.mitre_mapper import map_findings_to_mitre
 import re
 from email.utils import parseaddr
 from typing import Any
@@ -9,7 +10,9 @@ from src.auth_analyzer import (
     analyze_authentication,
     build_auth_findings,
 )
+from src.domain_analyzer import analyze_domain_similarity
 from src.schemas import Finding
+from src.sender_analyzer import analyze_sender_identity
 
 
 RISK_THRESHOLDS = (
@@ -185,7 +188,6 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
         email.get("authentication_results", [])
     )
 
-    # Authentication analyzer preserves its legacy dictionary interface.
     auth_findings = build_auth_findings(authentication)
 
     findings.extend(
@@ -199,7 +201,7 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
     if reply_finding is not None:
         findings.append(reply_finding)
 
-        # 3. Analyse URLs.
+    # 3. Analyse URLs.
     findings.extend(
         analyze_urls(email.get("body", ""))
     )
@@ -209,9 +211,14 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
 
     if sender_finding is not None:
         findings.append(sender_finding)
-    
 
-    # 5. Detect urgency language.
+    # 5. Detect sender-domain similarity / typosquatting.
+    domain_finding = analyze_domain_similarity(email)
+
+    if domain_finding is not None:
+        findings.append(domain_finding)
+
+    # 6. Detect urgency language.
     urgency_finding = analyze_urgency(
         email.get("subject", "") + " " + email.get("body", "")
     )
@@ -219,13 +226,13 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
     if urgency_finding is not None:
         findings.append(urgency_finding)
 
-    # 6. Calculate final risk score once.
+    # 7. Calculate final risk score once.
     score = min(
         100,
         sum(finding.score for finding in findings)
     )
 
-    # 7. Determine risk level.
+    # 8. Determine risk level.
     risk_level = "LOW"
 
     for level, minimum in RISK_THRESHOLDS:
@@ -233,11 +240,24 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
             risk_level = level
             break
 
-    # Convert Finding objects to the legacy dictionary format.
+    # Preserve the legacy dictionary format for V1 compatibility.
     legacy_findings = [
         finding.to_dict()
         for finding in findings
     ]
+    attachment_results = analyze_attachments(
+            email.get("attachments", [])
+        )
+    
+    for attachment in attachment_results:
+            findings.extend(
+                Finding(**item)
+                for item in attachment["findings"]
+            )
+    mitre_techniques = map_findings_to_mitre(
+            legacy_findings
+        )
+    
 
     return {
         "risk_score": score,
@@ -245,4 +265,7 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
         "findings": legacy_findings,
         "total_findings": len(legacy_findings),
         "authentication": authentication,
+        "mitre_techniques": mitre_techniques,
+
     }
+        
