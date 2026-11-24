@@ -5,8 +5,10 @@ from src.incident_manager import (
     create_incident,
     get_incident,
     init_db,
+    list_audit_events,
     list_incidents,
     update_incident_status,
+    verify_audit_chain,
 )
 
 
@@ -112,3 +114,162 @@ def test_update_unknown_incident_returns_false(db_path):
     )
 
     assert result is False
+
+
+def test_incident_creation_generates_audit_event(
+    db_path, sample_analysis
+):
+    incident_id = create_incident(
+        sample_analysis,
+        db_path=db_path,
+        actor="analyst-01",
+    )
+
+    events = list_audit_events(incident_id, db_path=db_path)
+
+    assert len(events) == 1
+    assert events[0]["action"] == "INCIDENT_CREATED"
+    assert events[0]["new_status"] == "NEW"
+    assert events[0]["actor"] == "analyst-01"
+
+
+def test_status_change_generates_audit_event(
+    db_path, sample_analysis
+):
+    incident_id = create_incident(
+        sample_analysis,
+        db_path=db_path,
+    )
+
+    update_incident_status(
+        incident_id,
+        "INVESTIGATING",
+        db_path=db_path,
+        actor="analyst-02",
+    )
+
+    events = list_audit_events(incident_id, db_path=db_path)
+
+    assert len(events) == 2
+
+    status_event = events[0]
+
+    assert status_event["action"] == "STATUS_CHANGED"
+    assert status_event["old_status"] == "NEW"
+    assert status_event["new_status"] == "INVESTIGATING"
+    assert status_event["actor"] == "analyst-02"
+
+
+def test_same_status_does_not_create_duplicate_event(
+    db_path, sample_analysis
+):
+    incident_id = create_incident(
+        sample_analysis,
+        db_path=db_path,
+    )
+
+    update_incident_status(
+        incident_id,
+        "NEW",
+        db_path=db_path,
+    )
+
+    events = list_audit_events(incident_id, db_path=db_path)
+
+    assert len(events) == 1
+
+
+def test_audit_events_are_empty_for_unknown_incident(db_path):
+    events = list_audit_events(
+        "unknown-id",
+        db_path=db_path,
+    )
+
+    assert events == []
+
+
+def test_invalid_actor_is_rejected(db_path, sample_analysis):
+    with pytest.raises(ValueError):
+        create_incident(
+            sample_analysis,
+            db_path=db_path,
+            actor="",
+        )
+
+def test_audit_chain_is_valid_after_multiple_events(
+    db_path, sample_analysis
+):
+    incident_id = create_incident(
+        sample_analysis,
+        db_path=db_path,
+    )
+
+    update_incident_status(
+        incident_id,
+        "INVESTIGATING",
+        db_path=db_path,
+    )
+
+    result = verify_audit_chain(db_path)
+
+    assert result["valid"] is True
+    assert result["checked_events"] == 2
+
+
+def test_audit_chain_detects_event_modification(
+    db_path, sample_analysis
+):
+    incident_id = create_incident(
+        sample_analysis,
+        db_path=db_path,
+    )
+
+    import sqlite3
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("""
+            UPDATE incident_audit_logs
+            SET actor = 'unauthorized-user'
+            WHERE incident_id = ?
+        """, (incident_id,))
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = verify_audit_chain(db_path)
+
+    assert result["valid"] is False
+    assert result["reason"] == "Event hash mismatch"
+
+
+def test_audit_chain_detects_middle_event_deletion(
+    db_path, sample_analysis
+):
+    incident_id = create_incident(
+        sample_analysis,
+        db_path=db_path,
+    )
+
+    update_incident_status(
+        incident_id,
+        "INVESTIGATING",
+        db_path=db_path,
+    )
+
+    import sqlite3
+
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("""
+            DELETE FROM incident_audit_logs
+            WHERE incident_id = ?
+              AND action = 'INCIDENT_CREATED'
+        """, (incident_id,))
+        connection.commit()
+    finally:
+        connection.close()
+
+    result = verify_audit_chain(db_path)
+
+    assert result["valid"] is False

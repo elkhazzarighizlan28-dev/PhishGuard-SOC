@@ -5,6 +5,7 @@ from src.incident_manager import (
     init_db,
     list_incidents,
     get_incident,
+    list_audit_events,
     update_incident_status,
 )
 
@@ -159,6 +160,32 @@ def render_dashboard():
                 )
         else:
             st.info("No attachment information.")
+
+    with st.expander("Audit Trail", expanded=False):
+        events = list_audit_events(incident_id, limit=100)
+
+        if events:
+            st.caption(f"{len(events)} audit event(s) — newest first")
+
+            for event in events:
+                st.markdown(
+                    f"**{event['action']}** — "
+                    f"Actor: `{event['actor']}`"
+                )
+
+                old_status = event.get("old_status") or "—"
+                new_status = event.get("new_status") or "—"
+
+                if event["action"] == "STATUS_CHANGED":
+                    st.write(
+                        f"Status transition: **{old_status}** → "
+                        f"**{new_status}**"
+                    )
+
+                st.caption(f"Date: {event['created_at']}")
+                st.divider()
+        else:
+            st.info("No audit events recorded for this incident.")
 
     st.divider()
     st.subheader("Analyst Actions")
