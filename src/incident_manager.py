@@ -1,4 +1,5 @@
-from src.incident_manager import list_audit_events
+import hashlib
+import hmac
 import json
 import sqlite3
 import uuid
@@ -21,6 +22,37 @@ INCIDENT_STATUSES = {
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+
+def _calculate_audit_hash(
+    event_id: int,
+    incident_id: str,
+    actor: str,
+    action: str,
+    old_status: str | None,
+    new_status: str | None,
+    created_at: str,
+    previous_hash: str | None,
+) -> str:
+    payload = {
+        "id": event_id,
+        "incident_id": incident_id,
+        "actor": actor,
+        "action": action,
+        "old_status": old_status,
+        "new_status": new_status,
+        "created_at": created_at,
+        "previous_hash": previous_hash,
+    }
+
+    canonical_data = json.dumps(
+        payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    return hashlib.sha256(canonical_data).hexdigest()
 
 def get_connection(db_path: str | Path = DEFAULT_DB_PATH):
     path = Path(db_path)
@@ -71,11 +103,68 @@ def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> None:
                 old_status TEXT,
                 new_status TEXT,
                 created_at TEXT NOT NULL,
+                previous_hash TEXT,
+                event_hash TEXT,
                 FOREIGN KEY (incident_id)
                     REFERENCES incidents(id)
                     ON DELETE CASCADE
             )
         """)
+
+        audit_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(incident_audit_logs)"
+            ).fetchall()
+        }
+
+        if "previous_hash" not in audit_columns:
+            connection.execute(
+                "ALTER TABLE incident_audit_logs ADD COLUMN previous_hash TEXT"
+            )
+
+        if "event_hash" not in audit_columns:
+            connection.execute(
+                "ALTER TABLE incident_audit_logs ADD COLUMN event_hash TEXT"
+            )
+
+        # Backfill only a completely legacy chain.
+        legacy_events = connection.execute("""
+            SELECT id, incident_id, actor, action,
+                   old_status, new_status, created_at
+            FROM incident_audit_logs
+            ORDER BY id
+        """).fetchall()
+
+        if legacy_events and all(
+            connection.execute(
+                "SELECT previous_hash, event_hash "
+                "FROM incident_audit_logs WHERE id = ?",
+                (event["id"],),
+            ).fetchone()["event_hash"] is None
+            for event in legacy_events
+        ):
+            previous_hash = None
+
+            for event in legacy_events:
+                event_hash = _calculate_audit_hash(
+                    event_id=event["id"],
+                    incident_id=event["incident_id"],
+                    actor=event["actor"],
+                    action=event["action"],
+                    old_status=event["old_status"],
+                    new_status=event["new_status"],
+                    created_at=event["created_at"],
+                    previous_hash=previous_hash,
+                )
+
+                connection.execute("""
+                    UPDATE incident_audit_logs
+                    SET previous_hash = ?, event_hash = ?
+                    WHERE id = ?
+                """, (previous_hash, event_hash, event["id"]))
+
+                previous_hash = event_hash
 
         connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_audit_incident
@@ -102,27 +191,61 @@ def _record_audit_event(
     old_status: str | None = None,
     new_status: str | None = None,
 ) -> None:
-    connection.execute(
-        """
-        INSERT INTO incident_audit_logs (
-            incident_id,
-            actor,
-            action,
-            old_status,
-            new_status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            incident_id,
-            actor,
-            action,
-            old_status,
-            new_status,
-            utc_now(),
-        ),
+    previous_event = connection.execute("""
+        SELECT event_hash
+        FROM incident_audit_logs
+        ORDER BY id DESC
+        LIMIT 1
+    """).fetchone()
+
+    previous_hash = (
+        previous_event["event_hash"]
+        if previous_event is not None
+        else None
     )
+
+    if previous_event is not None and not previous_hash:
+        raise RuntimeError(
+            "Cannot extend an audit chain with an invalid previous event."
+        )
+
+    created_at = utc_now()
+
+    cursor = connection.execute("""
+        INSERT INTO incident_audit_logs (
+            incident_id, actor, action,
+            old_status, new_status, created_at,
+            previous_hash, event_hash
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    """, (
+        incident_id,
+        actor,
+        action,
+        old_status,
+        new_status,
+        created_at,
+        previous_hash,
+    ))
+
+    event_id = cursor.lastrowid
+
+    event_hash = _calculate_audit_hash(
+        event_id=event_id,
+        incident_id=incident_id,
+        actor=actor,
+        action=action,
+        old_status=old_status,
+        new_status=new_status,
+        created_at=created_at,
+        previous_hash=previous_hash,
+    )
+
+    connection.execute("""
+        UPDATE incident_audit_logs
+        SET event_hash = ?
+        WHERE id = ?
+    """, (event_hash, event_id))
 
 
 def create_incident(
@@ -337,85 +460,60 @@ def list_audit_events(
     finally:
         connection.close()
 
+def verify_audit_chain(
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> dict[str, Any]:
+    connection = get_connection(db_path)
 
+    try:
+        events = connection.execute("""
+            SELECT id, incident_id, actor, action,
+                   old_status, new_status, created_at,
+                   previous_hash, event_hash
+            FROM incident_audit_logs
+            ORDER BY id
+        """).fetchall()
 
+        expected_previous_hash = None
 
-def test_incident_creation_generates_audit_event(
-    db_path, sample_analysis
-):
-    incident_id = create_incident(
-        sample_analysis,
-        db_path=db_path,
-        actor="analyst-01",
-    )
+        for event in events:
+            if event["previous_hash"] != expected_previous_hash:
+                return {
+                    "valid": False,
+                    "checked_events": len(events),
+                    "invalid_event_id": event["id"],
+                    "reason": "Previous hash mismatch",
+                }
 
-    events = list_audit_events(incident_id, db_path=db_path)
+            expected_hash = _calculate_audit_hash(
+                event_id=event["id"],
+                incident_id=event["incident_id"],
+                actor=event["actor"],
+                action=event["action"],
+                old_status=event["old_status"],
+                new_status=event["new_status"],
+                created_at=event["created_at"],
+                previous_hash=event["previous_hash"],
+            )
 
-    assert len(events) == 1
-    assert events[0]["action"] == "INCIDENT_CREATED"
-    assert events[0]["new_status"] == "NEW"
-    assert events[0]["actor"] == "analyst-01"
+            stored_hash = event["event_hash"] or ""
 
+            if not hmac.compare_digest(expected_hash, stored_hash):
+                return {
+                    "valid": False,
+                    "checked_events": len(events),
+                    "invalid_event_id": event["id"],
+                    "reason": "Event hash mismatch",
+                }
 
-def test_status_change_generates_audit_event(
-    db_path, sample_analysis
-):
-    incident_id = create_incident(
-        sample_analysis,
-        db_path=db_path,
-    )
+            expected_previous_hash = stored_hash
 
-    update_incident_status(
-        incident_id,
-        "INVESTIGATING",
-        db_path=db_path,
-        actor="analyst-02",
-    )
+        return {
+            "valid": True,
+            "checked_events": len(events),
+            "invalid_event_id": None,
+            "reason": "Audit chain integrity verified",
+        }
 
-    events = list_audit_events(incident_id, db_path=db_path)
-
-    assert len(events) == 2
-
-    status_event = events[0]
-
-    assert status_event["action"] == "STATUS_CHANGED"
-    assert status_event["old_status"] == "NEW"
-    assert status_event["new_status"] == "INVESTIGATING"
-    assert status_event["actor"] == "analyst-02"
-
-
-def test_same_status_does_not_create_duplicate_event(
-    db_path, sample_analysis
-):
-    incident_id = create_incident(
-        sample_analysis,
-        db_path=db_path,
-    )
-
-    update_incident_status(
-        incident_id,
-        "NEW",
-        db_path=db_path,
-    )
-
-    events = list_audit_events(incident_id, db_path=db_path)
-
-    assert len(events) == 1
-
-
-def test_audit_events_are_empty_for_unknown_incident(db_path):
-    events = list_audit_events(
-        "unknown-id",
-        db_path=db_path,
-    )
-
-    assert events == []
-
-
-def test_invalid_actor_is_rejected(db_path, sample_analysis):
-    with pytest.raises(ValueError):
-        create_incident(
-            sample_analysis,
-            db_path=db_path,
-            actor="",
-        )
+    finally:
+        connection.close()
