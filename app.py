@@ -4,6 +4,8 @@ PhishGuard SOC — plateforme d'analyse et d'investigation d'e-mails suspects.
 Principes de sécurité appliqués dans ce fichier :
   * Aucun contenu d'e-mail n'est jamais rendu en HTML ni en Markdown
     (évite XSS, liens piégés et pixels de tracking distants).
+  * Les libellés envoyés aux graphes Plotly sont échappés (Plotly interprète
+    un sous-ensemble de HTML dans ses textes).
   * Les fichiers importés restent en mémoire : rien n'est écrit sur disque.
   * Taille, extension et structure du fichier sont validées avant l'analyse.
   * Les caractères de contrôle et de bidirectionnalité (spoofing visuel)
@@ -14,7 +16,6 @@ Principes de sécurité appliqués dans ce fichier :
 """
 
 from __future__ import annotations
-from src.incident_manager import create_incident
 
 import hashlib
 import html
@@ -29,7 +30,6 @@ from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr
 from pathlib import Path
-from sys import flags
 from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -43,12 +43,16 @@ try:  # seuils officiels du moteur, s'il les expose
 except ImportError:
     ENGINE_RISK_THRESHOLDS = None
 
+import plotly.graph_objects as go
+
+PLOTLY_OK = True
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 APP_NAME = "PhishGuard SOC"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 SAMPLE_PATH = BASE_DIR / "samples" / "suspicious_email.eml"
@@ -69,12 +73,50 @@ SEVERITY_ICON = {
     "LOW": "🟩",
     "INFO": "🟦",
 }
+SEVERITY_COLOR = {
+    "CRITICAL": "#ef4444",
+    "HIGH": "#f97316",
+    "MEDIUM": "#eab308",
+    "LOW": "#22c55e",
+    "INFO": "#38bdf8",
+}
+# Poids utilisé si le moteur ne fournit pas de score pour un constat.
+SEVERITY_WEIGHT = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 12, "LOW": 5, "INFO": 0}
+
 LEVEL_COLOR = {
     "CRITICAL": "#ef4444",
     "HIGH": "#f97316",
     "MEDIUM": "#eab308",
     "LOW": "#22c55e",
 }
+LEVEL_NOTE = {
+    "CRITICAL": "Plusieurs indicateurs forts. Ne pas interagir avec ce message et l'escalader immédiatement.",
+    "HIGH": "Message très probablement malveillant. Isoler et enquêter avant toute action.",
+    "MEDIUM": "Indicateurs suspects. Une vérification manuelle est nécessaire.",
+    "LOW": "Aucun indicateur fort. Cela ne garantit pas que le message soit légitime.",
+}
+RECOMMENDATIONS = {
+    "CRITICAL": [
+        "Ne cliquer sur aucun lien et n'ouvrir aucune pièce jointe.",
+        "Mettre le message en quarantaine et bloquer l'expéditeur et les domaines associés.",
+        "Rechercher les autres destinataires du même message dans la messagerie.",
+        "Si un utilisateur a interagi : réinitialiser ses mots de passe et ouvrir un incident.",
+    ],
+    "HIGH": [
+        "Isoler le message et ne pas interagir avec son contenu.",
+        "Vérifier la réputation des liens et domaines dans un environnement isolé.",
+        "Prévenir l'utilisateur concerné et signaler le message à l'équipe sécurité.",
+    ],
+    "MEDIUM": [
+        "Vérifier l'expéditeur par un autre canal (téléphone, messagerie interne).",
+        "Examiner les en-têtes et les liens avant toute réponse.",
+    ],
+    "LOW": [
+        "Aucune action urgente : rester vigilant sur le contexte du message.",
+        "Archiver l'analyse pour référence.",
+    ],
+}
+
 URL_SHORTENERS = {
     "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd",
     "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at",
@@ -110,6 +152,30 @@ STRUCT_HEADERS = ("from", "to", "subject", "date", "message-id", "received", "re
 # à aligner sur detection_engine.py.
 FALLBACK_RISK_THRESHOLDS = (("CRITICAL", 70), ("HIGH", 40), ("MEDIUM", 20))
 
+# Catégories du profil de menace (graphe radar) et mots-clés de classement.
+THREAT_CATEGORIES = [
+    "Authentification",
+    "Liens & URL",
+    "Expéditeur",
+    "Pièces jointes",
+    "Ingénierie sociale",
+]
+CATEGORY_KEYWORDS = {
+    "Authentification": ("spf", "dkim", "dmarc", "authentif"),
+    "Pièces jointes": ("attach", "pièce jointe", "piece jointe", "fichier joint", "macro", ".exe"),
+    "Liens & URL": ("url", "lien", "link", "http", "domain", "domaine", "punycode", "raccourc", "shortener"),
+    "Expéditeur": ("sender", "expéditeur", "expediteur", "reply", "usurp", "spoof",
+                   "display name", "en-tête", "header", "mismatch"),
+}
+# Correspondance indicative avec MITRE ATT&CK.
+MITRE_MAP = {
+    "Authentification": "T1672 — Email Spoofing",
+    "Liens & URL": "T1566.002 — Spearphishing Link",
+    "Expéditeur": "T1656 — Impersonation",
+    "Pièces jointes": "T1566.001 — Spearphishing Attachment",
+    "Ingénierie sociale": "T1566 — Phishing",
+}
+
 # Regex volontairement simples et bornées (pas de backtracking catastrophique).
 URL_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}]{1,2048}", re.IGNORECASE)
 IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
@@ -130,7 +196,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("phishguard")
 
 # ============================================================
-# PAGE
+# PAGE (doit rester le premier appel Streamlit)
 # ============================================================
 
 st.set_page_config(
@@ -143,46 +209,105 @@ st.set_page_config(
 # CSS statique uniquement : aucune donnée utilisateur n'y est injectée.
 STATIC_CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
-html, body, .stApp, [class*="css"] { font-family: 'IBM Plex Sans', system-ui, sans-serif; }
-code, pre, .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace !important; }
+html, body, .stApp, [class*="css"] { font-family: 'Space Grotesk', system-ui, sans-serif; }
+code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace !important; }
 
-.stApp { background: #0a0f1c; color: #e2e8f0; }
-section[data-testid="stSidebar"] { background: #0f1626; border-right: 1px solid #1c2740; }
-h1, h2, h3 { color: #f1f5f9; letter-spacing: -0.01em; }
-.block-container { padding-top: 2rem; max-width: 1240px; }
-
-div[data-testid="stMetric"] {
-    background: #111a2e; padding: 16px 18px; border-radius: 10px;
-    border: 1px solid #1f2c47;
+.stApp {
+    background:
+        radial-gradient(900px 500px at 8% -10%, rgba(34, 211, 238, .13), transparent 60%),
+        radial-gradient(800px 500px at 100% 0%, rgba(167, 139, 250, .12), transparent 60%),
+        #060a14;
+    color: #e2e8f0;
 }
-button[data-baseweb="tab"] { font-weight: 500; }
+header[data-testid="stHeader"] { background: transparent; }
+section[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #0b1222 0%, #080d1a 100%);
+    border-right: 1px solid rgba(148, 163, 184, .12);
+}
+h1, h2, h3 { color: #f8fafc; letter-spacing: -0.015em; }
+.block-container { padding-top: 1.6rem; max-width: 1280px; }
 
+/* ---------- Bandeau ---------- */
+.hero {
+    position: relative; overflow: hidden;
+    border: 1px solid rgba(148, 163, 184, .16); border-radius: 18px;
+    padding: 26px 30px; margin-bottom: 18px;
+    background: linear-gradient(120deg, rgba(34, 211, 238, .10), rgba(167, 139, 250, .08) 55%, rgba(15, 23, 42, .6));
+}
+.hero::after {
+    content: ""; position: absolute; right: -60px; top: -60px; width: 220px; height: 220px;
+    border-radius: 50%; background: radial-gradient(circle, rgba(34, 211, 238, .25), transparent 70%);
+}
+.hero-badge {
+    display: inline-block; font-size: .72rem; letter-spacing: .12em; text-transform: uppercase;
+    color: #67e8f9; border: 1px solid rgba(103, 232, 249, .35); border-radius: 999px;
+    padding: 3px 12px; margin-bottom: 10px; font-family: 'JetBrains Mono', monospace;
+}
+.hero h1 {
+    margin: 0; font-size: 2.1rem; font-weight: 700;
+    background: linear-gradient(90deg, #f8fafc, #67e8f9 60%, #c4b5fd);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero p { margin: 6px 0 0; color: #94a3b8; }
+
+/* ---------- Cartes ---------- */
+div[data-testid="stMetric"] {
+    background: rgba(15, 23, 42, .65); padding: 16px 18px; border-radius: 14px;
+    border: 1px solid rgba(148, 163, 184, .14);
+}
+div[data-testid="stExpander"] {
+    background: rgba(15, 23, 42, .5); border: 1px solid rgba(148, 163, 184, .14); border-radius: 12px;
+}
+div[data-testid="stPlotlyChart"] {
+    background: rgba(15, 23, 42, .55); border: 1px solid rgba(148, 163, 184, .14);
+    border-radius: 14px; padding: 6px;
+}
+
+/* ---------- Onglets ---------- */
+div[data-baseweb="tab-list"] { gap: 6px; border-bottom: 1px solid rgba(148, 163, 184, .14); }
+button[data-baseweb="tab"] {
+    font-weight: 500; border-radius: 10px 10px 0 0; padding: 8px 16px;
+}
+button[data-baseweb="tab"][aria-selected="true"] { background: rgba(34, 211, 238, .10); color: #67e8f9; }
+
+/* ---------- Carte de risque ---------- */
 .risk-card {
     display: flex; align-items: center; gap: 28px;
-    background: #111a2e; border: 1px solid #1f2c47; border-left: 4px solid var(--accent);
-    border-radius: 12px; padding: 22px 26px;
+    background: linear-gradient(120deg, rgba(15, 23, 42, .85), rgba(15, 23, 42, .55));
+    border: 1px solid rgba(148, 163, 184, .16); border-left: 5px solid var(--accent);
+    border-radius: 16px; padding: 22px 28px;
+    box-shadow: 0 0 40px -18px var(--accent);
 }
 .gauge {
-    --size: 128px;
+    --size: 132px;
     width: var(--size); height: var(--size); border-radius: 50%; flex: none;
     background: conic-gradient(var(--accent) calc(var(--pct) * 1%), #1e293b 0);
     display: grid; place-items: center; position: relative;
 }
 .gauge::before {
-    content: ""; position: absolute; inset: 11px; border-radius: 50%; background: #111a2e;
+    content: ""; position: absolute; inset: 12px; border-radius: 50%; background: #0b1222;
 }
-.gauge span { position: relative; font-size: 2.3rem; font-weight: 600; color: #f8fafc; }
-.gauge small { position: relative; display: block; font-size: .7rem; color: #94a3b8; margin-top: -6px; }
-.risk-level { font-size: 1.7rem; font-weight: 600; color: var(--accent); line-height: 1.1; }
-.risk-note { color: #94a3b8; margin-top: 6px; max-width: 46ch; line-height: 1.5; }
+.gauge > div { position: relative; text-align: center; }
+.gauge span { font-size: 2.4rem; font-weight: 700; color: #f8fafc; line-height: 1; }
+.gauge small { display: block; font-size: .7rem; color: #94a3b8; margin-top: 2px; }
+.risk-level { font-size: 1.8rem; font-weight: 700; color: var(--accent); line-height: 1.1; }
+.risk-note { color: #94a3b8; margin-top: 6px; max-width: 52ch; line-height: 1.5; }
 
-.pill {
-    display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: .78rem;
-    border: 1px solid #2a3a5c; color: #cbd5e1; margin-right: 6px;
+/* ---------- Indicateurs clés ---------- */
+.kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 16px 0 6px; }
+.kpi {
+    background: rgba(15, 23, 42, .65); border: 1px solid rgba(148, 163, 184, .14);
+    border-top: 3px solid var(--accent); border-radius: 14px; padding: 14px 18px;
 }
-@media (max-width: 640px) { .risk-card { flex-direction: column; align-items: flex-start; } }
+.kpi-label { color: #94a3b8; font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; }
+.kpi-value { color: #f8fafc; font-size: 1.9rem; font-weight: 700; margin-top: 2px; }
+
+@media (max-width: 800px) {
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .risk-card { flex-direction: column; align-items: flex-start; }
+}
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 """
@@ -201,6 +326,11 @@ def clean(value: Any, limit: int = MAX_FIELD_LEN) -> str:
     if len(text) > limit:
         text = text[:limit] + " … [tronqué]"
     return text
+
+
+def esc(value: Any, limit: int = 45) -> str:
+    """Texte sûr pour les libellés de graphes Plotly (qui interprètent un peu de HTML)."""
+    return html.escape(clean(value, limit))
 
 
 def defang_url(url: str) -> str:
@@ -225,6 +355,12 @@ def to_int(value: Any, default: int = 0) -> int:
 
 def clamp(value: int, low: int = 0, high: int = 100) -> int:
     return max(low, min(high, value))
+
+
+def rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 # ============================================================
@@ -295,6 +431,8 @@ def derive_level(score: int) -> str:
         if score >= minimum:
             return level
     return "LOW"
+
+
 def normalize_result(raw: Mapping[str, Any], auth: dict[str, str]) -> dict[str, Any]:
     findings: list[dict[str, Any]] = []
     for item in list(raw.get("findings") or [])[:MAX_FINDINGS]:
@@ -328,86 +466,69 @@ def normalize_result(raw: Mapping[str, Any], auth: dict[str, str]) -> dict[str, 
 def extract_iocs(body: str) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
-
-    # Limiter la taille du contenu analysé
     text = body[:MAX_BODY_ANALYSIS]
 
-    # 1. Extraction des URLs
+    # 1. URLs
     for match in URL_RE.finditer(text):
         if len(rows) >= MAX_IOCS:
             return rows
 
         url = match.group(0).rstrip(".,;:!?")
         key = ("URL", url)
-
         if key in seen:
             continue
-
         seen.add(key)
-        flags: list[str] = []
 
+        alerts: list[str] = []
         try:
             parsed = urlparse(url)
             host = (parsed.hostname or "").lower()
         except ValueError:
             parsed = None
             host = ""
-            flags.append("URL malformée")
+            alerts.append("URL malformée")
 
         if parsed is not None:
             if parsed.scheme == "http":
-                flags.append("HTTP non chiffré")
-
+                alerts.append("HTTP non chiffré")
             if parsed.username or "@" in parsed.netloc:
-                flags.append("identifiants dans l'URL")
-
+                alerts.append("identifiants dans l'URL")
             if host.startswith("xn--") or ".xn--" in host:
-                flags.append("domaine punycode")
-
+                alerts.append("domaine punycode")
             if host in URL_SHORTENERS:
-                flags.append("raccourcisseur")
-
+                alerts.append("raccourcisseur")
             try:
                 ipaddress.ip_address(host)
-                flags.append("hôte = adresse IP")
+                alerts.append("hôte = adresse IP")
             except ValueError:
                 pass
-
             try:
                 port = parsed.port
                 if port is not None and port not in (80, 443):
-                    flags.append(f"port atypique {port}")
+                    alerts.append(f"port atypique {port}")
             except ValueError:
-                flags.append("port invalide")
+                alerts.append("port invalide")
 
-        rows.append({
-            "Type": "URL",
-            "Valeur": url,
-            "Alertes": ", ".join(flags) or "—",
-        })
+        rows.append({"Type": "URL", "Valeur": url, "Alertes": ", ".join(alerts) or "—"})
 
-    # 2. Extraction des adresses IPv4
+    # 2. Adresses IPv4
     private_networks = (
         ipaddress.ip_network("10.0.0.0/8"),
         ipaddress.ip_network("172.16.0.0/12"),
         ipaddress.ip_network("192.168.0.0/16"),
     )
-
     for match in IPV4_RE.finditer(text):
         if len(rows) >= MAX_IOCS:
             return rows
 
         ip = match.group(0)
         key = ("IP", ip)
-
         if key in seen:
             continue
-
         try:
             addr = ipaddress.ip_address(ip)
         except ValueError:
             continue
-
         seen.add(key)
 
         if any(addr in network for network in private_networks):
@@ -417,44 +538,32 @@ def extract_iocs(body: str) -> list[dict[str, str]]:
         else:
             scope = "réservée / non publique"
 
-        rows.append({
-            "Type": "IP",
-            "Valeur": ip,
-            "Alertes": f"adresse {scope}",
-        })
+        rows.append({"Type": "IP", "Valeur": ip, "Alertes": f"adresse {scope}"})
 
-
-    # 3. Extraction des domaines
+    # 3. Domaines
     for match in DOMAIN_RE.finditer(text):
         if len(rows) >= MAX_IOCS:
             return rows
 
         domain = match.group(0).lower().rstrip(".")
         key = ("DOMAIN", domain)
-
         if key in seen:
             continue
-
-        # Exclure les adresses IP
         try:
             ipaddress.ip_address(domain)
             continue
         except ValueError:
             pass
-
         seen.add(key)
-        flags: list[str] = []
 
+        alerts = []
         if domain.startswith("xn--") or ".xn--" in domain:
-            flags.append("domaine punycode")
+            alerts.append("domaine punycode")
 
-        rows.append({
-            "Type": "DOMAIN",
-            "Valeur": domain,
-            "Alertes": ", ".join(flags) or "—",
-        })
+        rows.append({"Type": "DOMAIN", "Valeur": domain, "Alertes": ", ".join(alerts) or "—"})
 
     return rows
+
 
 def domain_of(address: str) -> str:
     _, addr = parseaddr(address)
@@ -477,7 +586,7 @@ def header_checks(email: Mapping[str, str]) -> list[str]:
 
 
 # ============================================================
-# ANALYSE (mise en cache par contenu, jamais par nom de fichier)
+# AUTHENTIFICATION (SPF / DKIM / DMARC)
 # ============================================================
 
 def validate_structure(data: bytes) -> None:
@@ -624,6 +733,47 @@ def evaluate_auth_trust(
     }
 
 
+# ============================================================
+# PROFIL DE MENACE (alimente les graphes)
+# ============================================================
+
+def categorize(finding: Mapping[str, Any]) -> str:
+    text = f'{finding["type"]} {finding["description"]}'.lower()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(keyword in text for keyword in keywords):
+            return category
+    return "Ingénierie sociale"
+
+
+def finding_points(finding: Mapping[str, Any]) -> int:
+    return finding["score"] if finding["score"] > 0 else SEVERITY_WEIGHT[finding["severity"]]
+
+
+def build_threat_profile(data: Mapping[str, Any]) -> dict[str, int]:
+    """Score 0-100 par catégorie : constats du moteur + signaux propres à l'application."""
+    profile = dict.fromkeys(THREAT_CATEGORIES, 0)
+
+    for finding in data["result"]["findings"]:
+        profile[categorize(finding)] += finding_points(finding)
+
+    auth = data["result"]["authentication"]
+    profile["Authentification"] += 40 * sum(status in AUTH_BAD for status in auth.values())
+    if data["auth_trust"]["mode"] != "verified":
+        profile["Authentification"] += 10  # non vérifiable : légère pénalité
+
+    profile["Liens & URL"] += 20 * sum(
+        1 for row in data["iocs"] if row["Type"] == "URL" and row["Alertes"] != "—"
+    )
+    profile["Expéditeur"] += 30 * len(data["header_notes"])
+
+    return {category: clamp(value) for category, value in profile.items()}
+
+
+# ============================================================
+# ANALYSE (mise en cache par contenu, jamais par nom de fichier)
+# ============================================================
+
+@st.cache_data(show_spinner=False, max_entries=20)
 def run_analysis(data: bytes, trusted_ids: tuple[str, ...]) -> dict[str, Any]:
     validate_structure(data)
     raw = parse_email_bytes(data)
@@ -637,7 +787,7 @@ def run_analysis(data: bytes, trusted_ids: tuple[str, ...]) -> dict[str, Any]:
         raise InvalidEmailFile("Le parser n'a extrait aucun contenu exploitable.")
 
     result = normalize_result(analyze_email(email), trust["auth"])
-    return {
+    analysis = {
         "email": email,
         "result": result,
         "iocs": extract_iocs(email["body"]),
@@ -647,6 +797,8 @@ def run_analysis(data: bytes, trusted_ids: tuple[str, ...]) -> dict[str, Any]:
             for key in ("mode", "trusted_ids", "ignored_ids", "claimed", "notes")
         },
     }
+    analysis["profile"] = build_threat_profile(analysis)
+    return analysis
 
 
 def load_source(source: str, uploaded) -> tuple[bytes | None, str]:
@@ -665,47 +817,180 @@ def load_source(source: str, uploaded) -> tuple[bytes | None, str]:
 
 
 # ============================================================
+# GRAPHES PLOTLY
+# ============================================================
+
+def style_figure(fig, height: int = 340):
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"family": "Space Grotesk, sans-serif", "color": "#cbd5e1"},
+        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+        height=height,
+        title_font={"size": 16, "color": "#f1f5f9"},
+    )
+    return fig
+
+
+def render_chart(fig, key: str) -> None:
+    if fig is None:
+        return
+    config = {"displayModeBar": False}
+    try:
+        st.plotly_chart(fig, width="stretch", config=config, key=key)
+    except Exception:  # noqa: BLE001 — anciennes versions de Streamlit
+        st.plotly_chart(fig, use_container_width=True, config=config, key=key)
+
+
+def fig_gauge(score: int, level: str):
+    color = LEVEL_COLOR.get(level, "#64748b")
+    steps: list[dict[str, Any]] = []
+    previous, previous_level = 0, "LOW"
+    for lvl, minimum in sorted(RISK_THRESHOLDS, key=lambda item: item[1]):
+        minimum = clamp(minimum)
+        if minimum > previous:
+            steps.append({"range": [previous, minimum], "color": rgba(LEVEL_COLOR[previous_level], 0.28)})
+        previous, previous_level = minimum, lvl
+    steps.append({"range": [previous, 100], "color": rgba(LEVEL_COLOR[previous_level], 0.28)})
+
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=score,
+        number={"suffix": "/100", "font": {"size": 42, "color": "#f8fafc"}},
+        title={"text": "Score de risque global"},
+        gauge={
+            "axis": {"range": [0, 100], "tickcolor": "#475569"},
+            "bar": {"color": color, "thickness": 0.3},
+            "bgcolor": "rgba(0,0,0,0)",
+            "borderwidth": 0,
+            "steps": steps,
+        },
+    ))
+    return style_figure(fig, 320)
+
+
+def fig_severity_donut(findings: Sequence[Mapping[str, Any]]):
+    counts = Counter(f["severity"] for f in findings)
+    labels = [s for s in SEVERITY_ORDER if counts[s] > 0]
+    if not labels:
+        return None
+    fig = go.Figure(go.Pie(
+        labels=[s.capitalize() for s in labels],
+        values=[counts[s] for s in labels],
+        hole=0.62,
+        marker={"colors": [SEVERITY_COLOR[s] for s in labels], "line": {"color": "#060a14", "width": 3}},
+        textinfo="value",
+        sort=False,
+    ))
+    fig.update_layout(
+        title="Répartition des constats par sévérité",
+        annotations=[{"text": f"<b>{len(findings)}</b><br>constats", "showarrow": False,
+                      "font": {"size": 16, "color": "#f8fafc"}}],
+        legend={"orientation": "h", "y": -0.05},
+    )
+    return style_figure(fig, 340)
+
+
+def fig_radar(profile: Mapping[str, int], level: str):
+    color = LEVEL_COLOR.get(level, "#22d3ee")
+    categories = list(profile)
+    values = [profile[c] for c in categories]
+    fig = go.Figure(go.Scatterpolar(
+        r=values + values[:1],
+        theta=categories + categories[:1],
+        fill="toself",
+        line={"color": color, "width": 2},
+        fillcolor=rgba(color, 0.25),
+        marker={"size": 7},
+        hovertemplate="%{theta} : %{r}/100<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Profil de menace par catégorie",
+        polar={
+            "bgcolor": "rgba(0,0,0,0)",
+            "radialaxis": {"range": [0, 100], "gridcolor": "#243049", "tickfont": {"size": 10}},
+            "angularaxis": {"gridcolor": "#243049"},
+        },
+        showlegend=False,
+    )
+    return style_figure(fig, 340)
+
+
+def fig_contributions(findings: Sequence[Mapping[str, Any]]):
+    ranked = sorted(enumerate(findings, start=1), key=lambda pair: -finding_points(pair[1]))[:10]
+    ranked = [(i, f) for i, f in ranked if finding_points(f) > 0]
+    if not ranked:
+        return None
+    fig = go.Figure(go.Bar(
+        x=[finding_points(f) for _, f in ranked],
+        y=[f"{i}. {esc(f['type'], 38)}" for i, f in ranked],
+        orientation="h",
+        marker={"color": [SEVERITY_COLOR[f["severity"]] for _, f in ranked]},
+        text=[finding_points(f) for _, f in ranked],
+        textposition="outside",
+        hovertemplate="%{y} : +%{x} points<extra></extra>",
+    ))
+    fig.update_layout(
+        title="Constats qui pèsent le plus dans le score",
+        yaxis={"autorange": "reversed"},
+        xaxis={"title": "Points de risque", "gridcolor": "#1e293b"},
+    )
+    return style_figure(fig, 360)
+
+
+def fig_iocs(iocs: Sequence[Mapping[str, str]]):
+    if not iocs:
+        return None
+    kinds = ["URL", "IP", "DOMAIN"]
+    flagged = [sum(1 for r in iocs if r["Type"] == k and r["Alertes"] != "—") for k in kinds]
+    plain = [sum(1 for r in iocs if r["Type"] == k and r["Alertes"] == "—") for k in kinds]
+    fig = go.Figure()
+    fig.add_bar(name="Avec alerte", x=kinds, y=flagged, marker_color="#f97316")
+    fig.add_bar(name="Sans alerte", x=kinds, y=plain, marker_color="#38bdf8")
+    fig.update_layout(
+        title="Indicateurs extraits (IOC)",
+        barmode="stack",
+        yaxis={"gridcolor": "#1e293b"},
+        legend={"orientation": "h", "y": -0.15},
+    )
+    return style_figure(fig, 340)
+
+
+# ============================================================
 # COMPOSANTS D'INTERFACE
 # ============================================================
 
+def hero() -> None:
+    st.markdown(
+        f"""
+        <div class="hero">
+            <div class="hero-badge">SOC · v{html.escape(APP_VERSION)}</div>
+            <h1>{html.escape(APP_NAME)}</h1>
+            <p>Détection et investigation d'e-mails de phishing</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 def risk_card(score: int, level: str) -> None:
-    notes = {
-        "CRITICAL": "Plusieurs indicateurs forts. Ne pas interagir avec ce message et l'escalader immédiatement.",
-        "HIGH": "Message très probablement malveillant. Isoler et enquêter avant toute action.",
-        "MEDIUM": "Indicateurs suspects. Une vérification manuelle est nécessaire.",
-        "LOW": "Aucun indicateur fort. Cela ne garantit pas que le message soit légitime.",
-    }
-
-    # Normalisation du score et du niveau de risque
     score = clamp(to_int(score))
     level = derive_level(score)
-
-    # Couleur selon le niveau de risque
-    colors = {
-        "CRITICAL": "#7f1d1d",
-        "HIGH": "#dc2626",
-        "MEDIUM": "#d97706",
-        "LOW": "#16a34a",
-    }
-    color = colors.get(level, "#64748b")
+    color = LEVEL_COLOR.get(level, "#64748b")
 
     st.markdown(
         f"""
-        <div class="risk-card" style="--accent:{color}; --pct:{int(score)};">
+        <div class="risk-card" style="--accent:{color}; --pct:{score};">
             <div class="gauge">
                 <div>
-                    <span>{int(score)}</span>
+                    <span>{score}</span>
                     <small>sur 100</small>
                 </div>
             </div>
             <div>
-                <div class="risk-level">
-                    Niveau {html.escape(level.lower())}
-                </div>
-                <div class="risk-note">
-                    {html.escape(notes[level])}
-                </div>
+                <div class="risk-level">Niveau {html.escape(level.lower())}</div>
+                <div class="risk-note">{html.escape(LEVEL_NOTE[level])}</div>
             </div>
         </div>
         """,
@@ -713,67 +998,116 @@ def risk_card(score: int, level: str) -> None:
     )
 
 
+def kpi_cards(items: Sequence[tuple[str, Any, str]]) -> None:
+    """Valeurs numériques ou constantes uniquement ; tout est échappé."""
+    cards = "".join(
+        f'<div class="kpi" style="--accent:{accent}">'
+        f'<div class="kpi-label">{html.escape(label)}</div>'
+        f'<div class="kpi-value">{html.escape(str(value))}</div></div>'
+        for label, value, accent in items
+    )
+    st.markdown(f'<div class="kpi-grid">{cards}</div>', unsafe_allow_html=True)
+
 
 def render_overview(data: dict[str, Any], show: Callable[[str], str]) -> None:
     email = data["email"]
     result = data["result"]
+    level = result["risk_level"]
+    severe = sum(f["severity"] in ("CRITICAL", "HIGH") for f in result["findings"])
 
-    # Affichage de la carte du risque
-    risk_card(result["risk_score"], result["risk_level"])
-    st.write("")
-
-    # Indicateurs principaux
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric("Score de risque", f'{result["risk_score"]}/100')
-    c2.metric("Constats", result["total_findings"])
-    c3.metric("Indicateurs extraits", len(data["iocs"]))
-
+    risk_card(result["risk_score"], level)
+    kpi_cards([
+        ("Score de risque", f'{result["risk_score"]}/100', LEVEL_COLOR.get(level, "#64748b")),
+        ("Constats", result["total_findings"], "#22d3ee"),
+        ("Critiques / élevés", severe, SEVERITY_COLOR["HIGH"]),
+        ("Indicateurs extraits", len(data["iocs"]), "#a78bfa"),
+    ])
     st.write("")
 
     left, right = st.columns([3, 2], gap="large")
 
-    # Informations sur l'e-mail
     with left:
         st.subheader("Message")
-
         st.caption("Expéditeur")
         st.code(show(email["from"]) or "Inconnu", language=None)
-
         st.caption("Adresse de réponse")
         st.code(show(email["reply_to"]) or "Non renseignée", language=None)
-
         st.caption("Objet")
         st.code(show(email["subject"]) or "Sans objet", language=None)
-
         st.caption("Date")
         st.text(email["date"] or "Inconnue")
 
-    # Répartition des constats
     with right:
-        st.subheader("Répartition")
-
-        counts = Counter(
-            finding["severity"]
-            for finding in result["findings"]
-        )
-
-        if counts:
-            chart = {
-                severity: counts[severity]
-                for severity in SEVERITY_ORDER
-                if counts[severity] > 0
-            }
-            st.bar_chart(chart, horizontal=True)
+        if PLOTLY_OK:
+            donut = fig_severity_donut(result["findings"])
+            if donut is not None:
+                render_chart(donut, "chart_overview_donut")
+            else:
+                st.success("Aucun constat à répartir.")
         else:
-            st.success("Aucun constat à répartir.")
+            counts = Counter(f["severity"] for f in result["findings"])
+            if counts:
+                st.bar_chart({s: counts[s] for s in SEVERITY_ORDER if counts[s] > 0}, horizontal=True)
+            else:
+                st.success("Aucun constat à répartir.")
 
-        # Vérification des en-têtes
         if data["header_notes"]:
             st.subheader("Contrôles d'en-têtes")
-
             for note in data["header_notes"]:
                 st.warning(note)
+
+    st.subheader("Actions recommandées")
+    for action in RECOMMENDATIONS[level]:
+        st.markdown(f"- {action}")
+
+
+def render_risk_analysis(data: dict[str, Any]) -> None:
+    result = data["result"]
+    profile = data["profile"]
+    level = result["risk_level"]
+
+    st.subheader("Mesure du danger")
+    st.caption(
+        "Le score global vient du moteur de détection. Le profil par catégorie combine les constats "
+        "du moteur et les contrôles propres à l'application (authentification, liens, en-têtes)."
+    )
+
+    if not PLOTLY_OK:
+        st.warning("Graphes avancés indisponibles : installez Plotly avec `pip install plotly`.")
+        st.bar_chart(profile)
+        return
+
+    col_a, col_b = st.columns(2, gap="medium")
+    with col_a:
+        render_chart(fig_gauge(result["risk_score"], level), "chart_gauge")
+    with col_b:
+        render_chart(fig_radar(profile, level), "chart_radar")
+
+    col_c, col_d = st.columns([3, 2], gap="medium")
+    with col_c:
+        contributions = fig_contributions(result["findings"])
+        if contributions is not None:
+            render_chart(contributions, "chart_contrib")
+        else:
+            st.info("Aucun constat n'ajoute de points au score.")
+    with col_d:
+        iocs_fig = fig_iocs(data["iocs"])
+        if iocs_fig is not None:
+            render_chart(iocs_fig, "chart_iocs")
+        else:
+            st.info("Aucun indicateur extrait.")
+
+    st.subheader("Cartographie MITRE ATT&CK (indicative)")
+    rows = [
+        {"Catégorie": cat, "Niveau (0-100)": score, "Technique associée": MITRE_MAP[cat]}
+        for cat, score in sorted(profile.items(), key=lambda item: -item[1])
+        if score > 0
+    ]
+    if rows:
+        st.dataframe(rows, hide_index=True, width="stretch")
+        st.caption("Correspondance générale par catégorie : à confirmer par l'analyste.")
+    else:
+        st.success("Aucune catégorie de menace active.")
 
 
 def render_authentication(auth: dict[str, str], trust: dict[str, Any]) -> None:
@@ -856,7 +1190,7 @@ def render_iocs(iocs: list[dict[str, str]], show: Callable[[str], str]) -> None:
         st.info("Aucun indicateur (URL ou adresse IP) trouvé dans le corps du message.")
         return
     rows = [{**row, "Valeur": show(row["Valeur"])} for row in iocs]
-    st.dataframe(rows, hide_index=True)
+    st.dataframe(rows, hide_index=True, width="stretch")
     if len(iocs) >= MAX_IOCS:
         st.caption(f"Liste limitée aux {MAX_IOCS} premiers indicateurs.")
     st.caption("Les liens ne sont jamais cliquables dans cette interface.")
@@ -888,6 +1222,7 @@ def build_report(data: dict[str, Any], sha256: str) -> str:
             "risk_score": result["risk_score"],
             "risk_level": result["risk_level"],
             "total_findings": result["total_findings"],
+            "threat_profile": data["profile"],
         },
         "authentication": {
             "results": result["authentication"],
@@ -904,12 +1239,22 @@ def build_report(data: dict[str, Any], sha256: str) -> str:
     return json.dumps(report, ensure_ascii=False, indent=2)
 
 
+def render_incidents() -> None:
+    """Tableau de bord des incidents enregistrés (src/dashboard.py)."""
+    try:
+        from src.dashboard import render_dashboard
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Dashboard des incidents indisponible : %s", exc)
+        st.error("Le module src/dashboard.py est introuvable ou contient une erreur.")
+        return
+    render_dashboard()
+
+
 # ============================================================
 # EN-TÊTE & BARRE LATÉRALE
 # ============================================================
 
-st.title("🛡️ PhishGuard SOC")
-st.caption("Détection et investigation d'e-mails de phishing")
+hero()
 
 with st.sidebar:
     st.header("Investigation")
@@ -949,6 +1294,15 @@ trusted_ids = parse_trusted_ids(trusted_input)
 # FLUX PRINCIPAL
 # ============================================================
 
+tab_overview, tab_risk, tab_auth, tab_findings, tab_iocs, tab_content, tab_report, tab_incidents = st.tabs(
+    ["Synthèse", "Analyse du risque", "Authentification", "Constats",
+     "Indicateurs", "Contenu", "Rapport", "Incidents"]
+)
+
+# L'onglet Incidents ne dépend pas de l'e-mail analysé : il reste visible même sans fichier.
+with tab_incidents:
+    render_incidents()
+
 try:
     raw_bytes, _ = load_source(source, uploaded)
 except InvalidEmailFile as error:
@@ -956,7 +1310,8 @@ except InvalidEmailFile as error:
     st.stop()
 
 if raw_bytes is None:
-    st.info("Choisissez l'e-mail d'exemple ou importez un fichier .eml pour démarrer.")
+    with tab_overview:
+        st.info("Choisissez l'e-mail d'exemple ou importez un fichier .eml pour démarrer.")
     st.stop()
 
 sha256 = hashlib.sha256(raw_bytes).hexdigest()
@@ -977,12 +1332,11 @@ log.info(
     sha256[:12], analysis["result"]["risk_score"], analysis["result"]["risk_level"],
 )
 
-tab_overview, tab_auth, tab_findings, tab_iocs, tab_content, tab_report = st.tabs(
-    ["Synthèse", "Authentification", "Constats", "Indicateurs", "Contenu", "Rapport"]
-)
-
 with tab_overview:
     render_overview(analysis, show)
+
+with tab_risk:
+    render_risk_analysis(analysis)
 
 with tab_auth:
     render_authentication(analysis["result"]["authentication"], analysis["auth_trust"])
