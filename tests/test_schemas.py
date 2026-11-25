@@ -2,6 +2,19 @@ import pytest
 
 from src.schemas import Finding
 
+VALID = {
+    "type": "TEST",
+    "severity": "LOW",
+    "description": "Description",
+    "evidence": "Evidence",
+    "score": 10,
+}
+
+
+def make_finding(**overrides):
+    """Construit un Finding valide en remplaçant uniquement les champs voulus."""
+    return Finding(**{**VALID, **overrides})
+
 
 def test_create_valid_finding():
     finding = Finding(
@@ -35,64 +48,54 @@ def test_convert_finding_to_legacy_dictionary():
     }
 
 
-def test_reject_empty_type():
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("type", ""),
+        ("type", None),
+        ("severity", "INFO"),
+        ("score", 101),
+        ("score", -1),
+    ],
+    ids=[
+        "empty_type",
+        "none_type",
+        "invalid_severity",
+        "score_above_100",
+        "negative_score",
+    ],
+)
+def test_reject_invalid_values(field, value):
     with pytest.raises(ValueError):
-        Finding("", "LOW", "Description", "Evidence", 10)
+        make_finding(**{field: value})
 
 
-def test_reject_invalid_severity():
-    with pytest.raises(ValueError):
-        Finding("TEST", "INFO", "Description", "Evidence", 10)
-
-
-def test_reject_score_above_100():
-    with pytest.raises(ValueError):
-        Finding("TEST", "HIGH", "Description", "Evidence", 101)
-
-
-def test_reject_negative_score():
-    with pytest.raises(ValueError):
-        Finding("TEST", "LOW", "Description", "Evidence", -1)
-
-
-def test_reject_boolean_score():
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("severity", 123),
+        ("severity", []),
+        ("description", None),
+        ("evidence", None),
+        ("score", True),
+        ("score", 10.5),
+    ],
+    ids=[
+        "int_severity",
+        "unhashable_severity",
+        "none_description",
+        "none_evidence",
+        "boolean_score",
+        "float_score",
+    ],
+)
+def test_reject_wrong_types(field, value):
     with pytest.raises(TypeError):
-        Finding("TEST", "LOW", "Description", "Evidence", True)
+        make_finding(**{field: value})
 
 
 def test_finding_is_immutable():
-    finding = Finding(
-        "TEST", "LOW", "Description", "Evidence", 10
-    )
+    finding = make_finding()
 
     with pytest.raises(AttributeError):
-        finding.score = 50
-
-def test_reject_non_string_severity():
-    with pytest.raises(TypeError):
-        Finding("TEST", 123, "Description", "Evidence", 10)
-
-
-def test_reject_unhashable_severity():
-    with pytest.raises(TypeError):
-        Finding("TEST", [], "Description", "Evidence", 10)
-
-
-def test_reject_non_string_type():
-    with pytest.raises(ValueError):
-        Finding(None, "LOW", "Description", "Evidence", 10)
-
-
-def test_reject_non_string_description():
-    with pytest.raises(TypeError):
-        Finding("TEST", "LOW", None, "Evidence", 10)
-
-
-def test_reject_non_string_evidence():
-    with pytest.raises(TypeError):
-        Finding("TEST", "LOW", "Description", None, 10)
-
-
-def test_reject_float_score():
-    with pytest.raises(TypeError):
-        Finding("TEST", "LOW", "Description", "Evidence", 10.5)
+        setattr(finding, "score", 50)
