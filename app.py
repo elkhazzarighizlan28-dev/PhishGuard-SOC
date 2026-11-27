@@ -36,7 +36,9 @@ from urllib.parse import urlparse
 import streamlit as st
 
 from src.detection_engine import analyze_email
+
 from src.email_parser import parse_email_bytes
+from src.incident_service import save_analysis_as_incident
 
 try:  # seuils officiels du moteur, s'il les expose
     from src.detection_engine import RISK_THRESHOLDS as ENGINE_RISK_THRESHOLDS
@@ -1239,15 +1241,7 @@ def build_report(data: dict[str, Any], sha256: str) -> str:
     return json.dumps(report, ensure_ascii=False, indent=2)
 
 
-def render_incidents() -> None:
-    """Tableau de bord des incidents enregistrés (src/dashboard.py)."""
-    try:
-        from src.dashboard import render_dashboard
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Dashboard des incidents indisponible : %s", exc)
-        st.error("Le module src/dashboard.py est introuvable ou contient une erreur.")
-        return
-    render_dashboard()
+
 
 
 # ============================================================
@@ -1294,14 +1288,13 @@ trusted_ids = parse_trusted_ids(trusted_input)
 # FLUX PRINCIPAL
 # ============================================================
 
-tab_overview, tab_risk, tab_auth, tab_findings, tab_iocs, tab_content, tab_report, tab_incidents = st.tabs(
+tab_overview, tab_risk, tab_auth, tab_findings, tab_iocs, tab_content, tab_report = st.tabs(
     ["Synthèse", "Analyse du risque", "Authentification", "Constats",
-     "Indicateurs", "Contenu", "Rapport", "Incidents"]
+     "Indicateurs", "Contenu", "Rapport"]
 )
 
 # L'onglet Incidents ne dépend pas de l'e-mail analysé : il reste visible même sans fichier.
-with tab_incidents:
-    render_incidents()
+
 
 try:
     raw_bytes, _ = load_source(source, uploaded)
@@ -1361,6 +1354,19 @@ with tab_report:
         mime="application/json",
     )
     st.caption("Les liens du rapport sont défangés. Aucun fichier n'est conservé sur le serveur.")
+    st.divider()
+    st.subheader("Gestion de l'incident")
+    if st.button("Enregistrer comme incident", type="primary", key="save_incident"):
+        try:
+            incident_id, created = save_analysis_as_incident(analysis, sha256, defang_text)
+        except Exception:  # noqa: BLE001
+            log.exception("Enregistrement de l'incident impossible (sha256=%s)", sha256)
+            st.error("Impossible d'enregistrer l'incident.")
+        else:
+            if created:
+                st.success(f"Incident enregistré : {incident_id[:8]}")
+            else:
+                st.info(f"Cet e-mail est déjà enregistré (incident {incident_id[:8]}).")
 
 st.divider()
 st.caption(f"{APP_NAME} {APP_VERSION} · Outil pédagogique d'investigation")

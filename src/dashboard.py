@@ -6,7 +6,9 @@ from src.incident_manager import (
     get_incident,
     update_incident_status,
     list_audit_events,
+    verify_audit_chain,
 )
+
 from src.report_generator import (
     generate_pdf_report,
     generate_json_report,
@@ -14,6 +16,28 @@ from src.report_generator import (
 )
 
 STATUS_OPTIONS = ["NEW", "INVESTIGATING", "RESOLVED", "FALSE_POSITIVE"]
+
+def render_audit_integrity():
+    st.markdown("**Audit Integrity**")
+    st.caption("Vérifie que l'historique des actions n'a pas été modifié après coup.")
+
+    if st.button("Vérifier l'intégrité de l'audit", key="dash_verify_chain"):
+        try:
+            report = verify_audit_chain()
+        except Exception:  # noqa: BLE001
+            st.error("Impossible de vérifier la chaîne d'audit.")
+            return
+
+        if report["valid"]:
+            st.success(
+                f"Chaîne d'audit intègre : {report['checked_events']} événement(s) vérifié(s)."
+            )
+        else:
+            st.error(
+                f"Intégrité compromise à l'événement #{report['invalid_event_id']} : "
+                f"{report['reason']}"
+            )
+            st.caption(f"{report['checked_events']} événement(s) dans la chaîne.")
 
 
 def render_dashboard():
@@ -29,6 +53,7 @@ def render_dashboard():
     critical = sum(i["risk_level"] == "CRITICAL" for i in incidents)
     high = sum(i["risk_level"] == "HIGH" for i in incidents)
     unresolved = sum(i["status"] in {"NEW", "INVESTIGATING"} for i in incidents)
+    
 
     st.markdown("**Security Overview**")
 
@@ -37,6 +62,9 @@ def render_dashboard():
     col2.metric("Critical", critical)
     col3.metric("High", high)
     col4.metric("Unresolved", unresolved)
+    
+    st.divider()
+    render_audit_integrity()
 
     st.divider()
     st.markdown("**Incident History**")
