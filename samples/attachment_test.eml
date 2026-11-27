@@ -1,0 +1,21 @@
+From: support@example.com
+To: victime@example.org
+Subject: Facture =?utf-8?q?impay=C3=A9e?=
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="===============8942719222044579754=="
+
+--===============8942719222044579754==
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: 8bit
+
+Veuillez consulter la pièce jointe.
+
+--===============8942719222044579754==
+Content-Type: application/octet-stream
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="facture.pdf.exe"
+MIME-Version: 1.0
+
+TVogZmFrZSBjb250ZW50
+
+--===============8942719222044579754==--

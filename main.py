@@ -1,6 +1,8 @@
 
 from src.email_parser import parse_email
 from src.detection_engine import analyze_email
+from src.incident_service import save_analysis_as_incident
+from src.attachment_analyzer import analyze_attachments
 
 
 def main():

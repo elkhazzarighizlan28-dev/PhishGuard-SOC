@@ -35,10 +35,11 @@ from urllib.parse import urlparse
 
 import streamlit as st
 
+from src.attachment_analyzer import analyze_attachments
 from src.detection_engine import analyze_email
-
 from src.email_parser import parse_email_bytes
 from src.incident_service import save_analysis_as_incident
+from src.received_analyzer import SLOW_HOP_SECONDS, analyze_received
 
 try:  # seuils officiels du moteur, s'il les expose
     from src.detection_engine import RISK_THRESHOLDS as ENGINE_RISK_THRESHOLDS
@@ -66,6 +67,7 @@ MAX_FIELD_LEN = 1_000
 MAX_EVIDENCE_LEN = 3_000
 MAX_FINDINGS = 200
 MAX_IOCS = 150
+MAX_ATTACHMENTS = 20
 
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
 SEVERITY_ICON = {
@@ -775,6 +777,44 @@ def build_threat_profile(data: Mapping[str, Any]) -> dict[str, int]:
 # ANALYSE (mise en cache par contenu, jamais par nom de fichier)
 # ============================================================
 
+def format_size(size: int) -> str:
+    value = float(size)
+    for unit in ("o", "Ko", "Mo"):
+        if value < 1024:
+            return f"{value:.0f} {unit}" if unit == "o" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} Go"
+
+
+def summarize_attachments(raw_attachments: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Garde nom, type, taille, SHA-256 et alertes. Jamais le contenu binaire."""
+    try:
+        analyzed = analyze_attachments(list(raw_attachments)[:MAX_ATTACHMENTS])
+    except (TypeError, ValueError):
+        log.warning("Analyse des pièces jointes impossible.")
+        return []
+
+    return [
+        {
+            "filename": clean(item["filename"], 255),
+            "content_type": clean(item["content_type"], 100),
+            "size": to_int(item["size"]),
+            "sha256": clean(item["sha256"], 64),
+            "findings": [
+                {
+                    "type": clean(f["type"], 100),
+                    "severity": clean(f["severity"], 20).upper(),
+                    "description": clean(f["description"], 500),
+                    "evidence": clean(f["evidence"], 500),
+                    "score": to_int(f["score"]),
+                }
+                for f in item["findings"]
+            ],
+        }
+        for item in analyzed
+    ]
+
+
 @st.cache_data(show_spinner=False, max_entries=20)
 def run_analysis(data: bytes, trusted_ids: tuple[str, ...]) -> dict[str, Any]:
     validate_structure(data)
@@ -788,12 +828,19 @@ def run_analysis(data: bytes, trusted_ids: tuple[str, ...]) -> dict[str, Any]:
     if not (email["from"] or email["subject"] or email["body"]):
         raise InvalidEmailFile("Le parser n'a extrait aucun contenu exploitable.")
 
-    result = normalize_result(analyze_email(email), trust["auth"])
+    raw_attachments = raw.get("attachments", []) if isinstance(raw, Mapping) else []
+
+    # Le moteur reçoit le contenu des pièces jointes ; `analysis` n'en garde rien (cache léger).
+    result = normalize_result(
+        analyze_email({**email, "attachments": raw_attachments}), trust["auth"]
+    )
     analysis = {
         "email": email,
         "result": result,
         "iocs": extract_iocs(email["body"]),
         "header_notes": header_checks(email),
+        "received": analyze_received(data),
+        "attachments": summarize_attachments(raw_attachments),
         "auth_trust": {
             key: trust[key]
             for key in ("mode", "trusted_ids", "ignored_ids", "claimed", "notes")
@@ -957,6 +1004,21 @@ def fig_iocs(iocs: Sequence[Mapping[str, str]]):
         legend={"orientation": "h", "y": -0.15},
     )
     return style_figure(fig, 340)
+
+
+def fig_hop_delays(hops: Sequence[Mapping[str, Any]]):
+    points = [(h["hop"], h["delay_s"]) for h in hops if h["delay_s"] is not None]
+    if not points:
+        return None
+    fig = go.Figure(go.Bar(
+        x=[f"Saut {n}" for n, _ in points],
+        y=[d for _, d in points],
+        marker={"color": ["#ef4444" if d < 0 or d > SLOW_HOP_SECONDS else "#22d3ee"
+                          for _, d in points]},
+        hovertemplate="%{x} : %{y} s<extra></extra>",
+    ))
+    fig.update_layout(title="Délai entre les sauts (secondes)", yaxis={"gridcolor": "#1e293b"})
+    return style_figure(fig, 320)
 
 
 # ============================================================
@@ -1208,6 +1270,111 @@ def render_content(email: dict[str, str], show: Callable[[str], str]) -> None:
             st.caption(f"Affichage limité à {MAX_BODY_DISPLAY:,} caractères.".replace(",", " "))
 
 
+def format_delay(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    sign = "-" if seconds < 0 else ""
+    s = abs(seconds)
+    if s < 60:
+        return f"{sign}{s} s"
+    if s < 3600:
+        return f"{sign}{s // 60} min {s % 60} s"
+    return f"{sign}{s // 3600} h {(s % 3600) // 60} min"
+
+
+def render_received(data: dict[str, Any]) -> None:
+    received = data["received"]
+    st.subheader("Chaîne de transmission (Received)")
+
+    for note in received["notes"]:
+        st.warning(note)
+
+    hops = received["hops"]
+    if not hops:
+        st.info("Aucun en-tête Received exploitable dans ce message.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Sauts", len(hops))
+    c2.metric("Délai total", format_delay(received["total_delay_s"]))
+    c3.metric("IP d'origine probable", received["origin_ip"] or "—")
+
+    st.dataframe(
+        [
+            {
+                "Saut": hop["hop"],
+                "De": hop["from"] or "—",
+                "Vers": hop["by"] or "—",
+                "IP": ", ".join(hop["ips"]) or "—",
+                "Heure (UTC)": hop["time"] or "—",
+                "Délai": format_delay(hop["delay_s"]),
+                "Alertes": ", ".join(hop["flags"]) or "—",
+            }
+            for hop in hops
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+
+    render_chart(fig_hop_delays(hops), "chart_hops")
+
+    st.caption(
+        "Seuls les en-têtes Received ajoutés par votre propre serveur sont fiables : "
+        "ceux situés plus bas ont pu être inventés par l'expéditeur."
+    )
+
+
+def render_attachments(data: dict[str, Any]) -> None:
+    attachments = data["attachments"]
+    st.subheader("Pièces jointes")
+
+    if not attachments:
+        st.info("Aucune pièce jointe dans ce message.")
+        return
+
+    flagged = sum(1 for item in attachments if item["findings"])
+    c1, c2 = st.columns(2)
+    c1.metric("Pièces jointes", len(attachments))
+    c2.metric("Avec alerte", flagged)
+
+    st.dataframe(
+        [
+            {
+                "Fichier": item["filename"],
+                "Type": item["content_type"],
+                "Taille": format_size(item["size"]),
+                "Alertes": len(item["findings"]),
+                "SHA-256": item["sha256"],
+            }
+            for item in attachments
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+
+    # Le titre d'un expander est rendu en Markdown : on n'y met pas le nom du fichier.
+    for index, item in enumerate(attachments, start=1):
+        icon = "🟧" if item["findings"] else "🟩"
+        with st.expander(f"{icon} Pièce jointe {index}", expanded=bool(item["findings"])):
+            st.caption("Nom du fichier")
+            st.code(item["filename"], language=None)
+            st.caption("SHA-256")
+            st.code(item["sha256"], language=None)
+            if item["findings"]:
+                for finding in item["findings"]:
+                    st.text(
+                        f'[{finding["severity"]}] {finding["type"]} (+{finding["score"]})\n'
+                        f'{finding["description"]}'
+                    )
+                    st.code(finding["evidence"], language=None)
+            else:
+                st.success("Aucune alerte sur cette pièce jointe.")
+
+    st.caption(
+        "Les fichiers ne sont jamais ouverts ni exécutés : seuls le nom, le type et l'empreinte sont analysés."
+    )
+
+
 def build_report(data: dict[str, Any], sha256: str) -> str:
     email, result = data["email"], data["result"]
     report = {
@@ -1236,12 +1403,13 @@ def build_report(data: dict[str, Any], sha256: str) -> str:
         "findings": [
             {**f, "evidence": defang_text(f["evidence"])} for f in result["findings"]
         ],
+        "attachments": [
+            {key: item[key] for key in ("filename", "content_type", "size", "sha256")}
+            for item in data["attachments"]
+        ],
         "indicators": [{**r, "Valeur": defang_text(r["Valeur"])} for r in data["iocs"]],
     }
     return json.dumps(report, ensure_ascii=False, indent=2)
-
-
-
 
 
 # ============================================================
@@ -1288,13 +1456,11 @@ trusted_ids = parse_trusted_ids(trusted_input)
 # FLUX PRINCIPAL
 # ============================================================
 
-tab_overview, tab_risk, tab_auth, tab_findings, tab_iocs, tab_content, tab_report = st.tabs(
-    ["Synthèse", "Analyse du risque", "Authentification", "Constats",
-     "Indicateurs", "Contenu", "Rapport"]
+(tab_overview, tab_risk, tab_auth, tab_received, tab_attachments,
+ tab_findings, tab_iocs, tab_content, tab_report) = st.tabs(
+    ["Synthèse", "Analyse du risque", "Authentification", "Received",
+     "Pièces jointes", "Constats", "Indicateurs", "Contenu", "Rapport"]
 )
-
-# L'onglet Incidents ne dépend pas de l'e-mail analysé : il reste visible même sans fichier.
-
 
 try:
     raw_bytes, _ = load_source(source, uploaded)
@@ -1333,6 +1499,12 @@ with tab_risk:
 
 with tab_auth:
     render_authentication(analysis["result"]["authentication"], analysis["auth_trust"])
+
+with tab_received:
+    render_received(analysis)
+
+with tab_attachments:
+    render_attachments(analysis)
 
 with tab_findings:
     render_findings(analysis["result"], show)

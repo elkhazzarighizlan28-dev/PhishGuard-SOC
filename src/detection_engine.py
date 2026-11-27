@@ -249,15 +249,10 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
             email.get("attachments", [])
         )
     
-    for attachment in attachment_results:
-            findings.extend(
-                Finding(**item)
-                for item in attachment["findings"]
-            )
-    mitre_techniques = map_findings_to_mitre(
-            legacy_findings
-        )
-    
+    # Pièces jointes : à analyser AVANT le calcul du score.
+    for attachment in analyze_attachments(email.get("attachments", [])):
+        findings.extend(Finding(**item) for item in attachment["findings"])
+      
 
     return {
         "risk_score": score,
@@ -265,7 +260,7 @@ def analyze_email(email: dict[str, Any]) -> dict[str, Any]:
         "findings": legacy_findings,
         "total_findings": len(legacy_findings),
         "authentication": authentication,
-        "mitre_techniques": mitre_techniques,
+        
 
     }
         

@@ -1,4 +1,23 @@
 .venv/
+.env
+.streamlit/secrets.toml
+__pycache__/
+.pytest_cache/
+*.pyc
+.DS_Store
+.agents/
+
+# Local backup files
+*.bak
+*.before-fix
+
+# Local databases and backups
+data/
+backups/
+*.db
+*.db-shm
+*.db-wal
+.venv/
 __pycache__/
 *.bak
 *.before-fix
